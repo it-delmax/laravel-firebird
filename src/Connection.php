@@ -10,9 +10,30 @@ use Firebird\Query\Processors\FirebirdProcessor as Processor;
 use Firebird\Schema\Builder as SchemaBuilder;
 use Firebird\Schema\Grammars\FirebirdGrammar as SchemaGrammar;
 use PDO;
+use Throwable;
 
 class Connection extends \Illuminate\Database\Connection
 {
+
+  /**
+   * Firebird messages that mean the attachment is dead. Laravel's LostConnectionDetector does not
+   * know them (of the Firebird messages it only has "Error writing data to the connection"), so
+   * without this no reconnect + retry happens. Typical case: a long-lived process (Horizon worker,
+   * Octane) holds an attachment that a nightly `gfix -shut -force` killed; the first statement in
+   * the morning returns -902 "database <name> shutdown" and every next one on the same handle
+   * -901 "invalid request handle".
+   *
+   * @var list<string> regexes matched against the PDOException message (which carries no SQL)
+   */
+  protected const LOST_CONNECTION_PATTERNS = [
+    '/\bdatabase\b.*\bshutdown\b/',                // isc_shutdown: database @1 shutdown
+    '/\bconnection shutdown\b/',                   // isc_att_shutdown
+    '/\binvalid request handle\b/',                // isc_bad_req_handle
+    '/\binvalid database handle\b/',               // isc_bad_db_handle
+    '/\bconnection lost to database\b/',           // isc_lost_db_connection
+    '/\bUnable to complete network request\b/',    // isc_network_error
+    '/\bError reading data from the connection\b/', // isc_net_read_err
+  ];
 
   /**
    * Firebird Engine version
@@ -20,6 +41,29 @@ class Connection extends \Illuminate\Database\Connection
    * @var string
    */
   private $engine_version = null;
+
+  /**
+   * Whether the exception was caused by a lost connection (Laravel then reconnects and retries
+   * the query, outside a transaction). Recognises the Firebird messages on top of Laravel's list.
+   *
+   * @param \Throwable $e
+   * @return bool
+   */
+  protected function causedByLostConnection(Throwable $e)
+  {
+    if (parent::causedByLostConnection($e)) {
+      return true;
+    }
+
+    $message = $e->getMessage();
+    foreach (self::LOST_CONNECTION_PATTERNS as $pattern) {
+      if (preg_match($pattern, $message)) {
+        return true;
+      }
+    }
+
+    return false;
+  }
 
   /**
    * Get engine version
